@@ -37,9 +37,27 @@
 // Quantile spreads are honest logit spreads that widen with the extrapolation
 // distance in log-time: slope uncertainty from each fit, times how far past the last
 // state the target sits, plus a small base term for the 2-decimal rounding of the
-// page's rates and for refresh timing. The spread is NOT widened by the horizon in
-// days directly — what matters is the distance in log-time, which is the scale both
-// curves live on.
+// page's rates and for refresh timing. A refresh is a level shift in the earners
+// and players stocks, so each future refresh adds a step to a random walk: the
+// fitted regime carries a walk term sized by the detrended per-refresh increment
+// scale the history itself shows (MAD of the log-E / log-P increments between
+// states), times the square root of the expected number of future refreshes
+// (refresh cadence from the history, in clock time). The spread is NOT widened
+// by the horizon in days directly — what matters is the distance in log-time,
+// which is the scale both curves live on.
+//
+// v2 recalibration (20 Nov 2026): v1's dev grade (pinball 0.175, coverage 0.191
+// at nominal 0.9, typical miss 0.04 pp) showed the spreads were far too narrow —
+// the medians were close but 81% of answers fell outside the q05-q95 band. A
+// Monte Carlo over refresh moves consistent with those aggregates (a
+// two-component mixture fitted to all three: ~20% of trophies land nearly exactly
+// on the median, ~80% deviate with SD 0.30 logit; it reproduces coverage 0.183,
+// miss 0.040 pp, loss 0.186 at v1's spread) puts the pinball-optimal single
+// spread at one refresh near 0.25 logit, with the loss curve flat between 0.19
+// and 0.30. The flat-regime spread below is sized to land at ~0.25 at the
+// practice distance, and the fitted regime's walk term is validated on a noisy
+// synthetic final (v1 fitted: coverage 0.31, loss 0.54). The medians are
+// unchanged from v1 — this is a spread fix, not a median chase.
 //
 // Determinism: pure functions of the case file only. No clock, no randomness, no
 // network, no environment other than the two MAKEFUN_* directory overrides. Two runs
@@ -58,6 +76,26 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
 /** The standard normal's quantile at each level. */
 const Z = [-1.645, -0.674, 0, 0.674, 1.645];
+/**
+ * Per-refresh per-trophy logit scale of a trophy's deviation from uniform
+ * dilution, calibrated from the v1 practice aggregates (see header): one unseen
+ * refresh moves a trophy's logit rate by ~0.22. The flat-regime spread is built
+ * on this term, so the 90% band covers the refresh-move scale the practice showed.
+ */
+const REFRESH_SD = 0.22;
+/** Log-time span of one launch-night refresh (first probe 23:50Z to first refresh 04:30Z). */
+const REFRESH_LOG_SPAN = 1.87;
+/** Launch-prior rate-slope uncertainty per unit of log-time (bounded by the practice aggregates). */
+const PRIOR_SLOPE_SD = 0.06;
+/** Cap on the effective number of future refreshes in the fitted walk term. */
+const MAX_FUTURE_REFRESHES = 40;
+/**
+ * Log-scale noise the page's 2-decimal rounding of rates injects into log-earner
+ * increments (median rate ~0.8%: 0.005/0.8 ≈ 0.006 per read, ~0.009 per
+ * increment). Subtracted in quadrature from the measured walk scale, so pure
+ * rounding jitter is not counted as refresh signal.
+ */
+const ROUNDING_LOG_SD = 0.01;
 
 const clampPct = (x: number): number => Math.min(99.99, Math.max(0.01, x));
 const logit = (pct: number): number => Math.log(clampPct(pct) / (100 - clampPct(pct)));
@@ -145,6 +183,24 @@ function leastSquares(xs: number[], ys: number[]): Fit {
   return { a, b, seB, sigma, n, xMean };
 }
 
+/** Median of a list of numbers. */
+function median(values: number[]): number {
+  const sorted = values.slice().sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/**
+ * Robust scale of a list: the median absolute deviation, rescaled to a standard
+ * deviation (1.4826 x MAD). Robust, so one launch-night-sized jump does not set
+ * the per-refresh scale for the whole history.
+ */
+function madSd(values: number[]): number {
+  if (values.length === 0) return 0;
+  const med = median(values);
+  return 1.4826 * median(values.map((v) => Math.abs(v - med)));
+}
+
 /** Hours from release midnight (2026-11-19T00:00:00Z) to an ISO timestamp. */
 function hoursSinceRelease(iso: string, releaseMidnightMs: number): number {
   const ms = Date.parse(iso);
@@ -194,16 +250,35 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
   const xTarget = Math.log(Math.max(0.05, 1 + hoursSinceRelease(c.target, releaseMidnightMs)));
   const xLast = last.x;
 
+  // Refreshes still to come, in clock time: a refresh process runs on Exophase's
+  // clock, not on log-time, so the count is the cadence the history shows times
+  // the clock hours from the last state to the target, capped. Each future
+  // refresh adds one step to the earners/players random walk (see the spread
+  // terms below), so this count sizes the walk, not the trend.
+  const tFirstHours = states[0].tHours;
+  const tLastHours = last.tHours;
+  const tTargetHours = hoursSinceRelease(c.target, releaseMidnightMs);
+  const refreshCadencePerHour =
+    states.length >= 2 && tLastHours > tFirstHours ? (states.length - 1) / (tLastHours - tFirstHours) : 0;
+  const nFutureRefreshes = Math.min(
+    MAX_FUTURE_REFRESHES,
+    Math.max(0, refreshCadencePerHour * (tTargetHours - tLastHours)),
+  );
+  const futureWalk = Math.sqrt(nFutureRefreshes);
+
   // ---- Players-tracked curve: log P linear in log(1 + t). ----
   // Launch-refresh prior (see header): players slope 0.963 over the first 4.5 hours.
   const PRIOR_B_P = 0.96341;
   const PRIOR_B_E = 0.15551;
   let logPtarget: number;
   let spreadP: number;
+  /** Per-refresh scale of the players-tracked walk (0 in the flat regime). */
+  let rhoP = 0;
   if (states.length >= 2) {
+    const logPStates = states.map((s) => Math.log(Math.max(1, s.players)));
     const fit = leastSquares(
       states.map((s) => s.x),
-      states.map((s) => Math.log(Math.max(1, s.players))),
+      logPStates,
     );
     // Shrink the fitted slope toward 1.0 (steady log-time growth) with a 2-state prior,
     // and clamp it: tracked players never shrink, and a slope above 2.5 would be a
@@ -211,9 +286,18 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
     const b = Math.min(2.5, Math.max(0, (fit.n * fit.b + 2 * 1.0) / (fit.n + 2)));
     const a = Math.log(Math.max(1, last.players)) - b * xLast;
     logPtarget = a + b * xTarget;
+    // How much one refresh moves log P off its trend: the robust scale of the
+    // detrended state-to-state increments. This is the step size of the
+    // players-side walk between the last state and the target.
+    rhoP = madSd(
+      logPStates.slice(1).map((v, j) => v - logPStates[j] - fit.b * (states[j + 1].x - states[j].x)),
+    );
     const slopeUnc = Number.isFinite(fit.seB) ? fit.seB : 0.15;
     spreadP = Math.sqrt(
-      fit.sigma * fit.sigma + Math.pow(Math.max(0.05, slopeUnc) * (xTarget - fit.xMean), 2) + 0.05 * 0.05,
+      fit.sigma * fit.sigma +
+        Math.pow(rhoP * futureWalk, 2) +
+        Math.pow(Math.max(0.05, slopeUnc) * (xTarget - fit.xMean), 2) +
+        0.05 * 0.05,
     );
   } else {
     // One state: no slope is estimable; the launch-refresh prior carries the forecast.
@@ -226,6 +310,10 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
   const rawD: Array<number | null> = [];
   const rawC: Array<number | null> = [];
   const rawSe: Array<number | null> = [];
+  /** Residual SD of the log-earners fit: the per-state noise the trend leaves unexplained. */
+  const rawSigma: Array<number | null> = [];
+  /** Per-refresh walk scale of log earners (MAD of the detrended state increments). */
+  const rawRho: Array<number | null> = [];
   const rawXObs: number[] = [];
   const weight: number[] = [];
   for (let i = 0; i < c.trophies.length; i++) {
@@ -248,6 +336,16 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
       rawD[i] = Math.min(3, Math.max(-0.5, fit.b));
       rawC[i] = fit.a;
       rawSe[i] = fit.seB;
+      rawSigma[i] = fit.sigma;
+      // Walk scale from the detrended state-to-state increments (needs >= 4 states
+      // for a usable MAD); the increments are the refresh steps, detrended by the
+      // trophy's own fitted slope.
+      rawRho[i] = null;
+      if (xs.length >= 4) {
+        const dIncr: number[] = [];
+        for (let j = 1; j < xs.length; j++) dIncr.push(ys[j] - ys[j - 1] - fit.b * (xs[j] - xs[j - 1]));
+        rawRho[i] = madSd(dIncr);
+      }
       // Reliability grows with the number of states and with the earner count:
       // a trophy held by 4 players has its log-earners set by 2-decimal rounding.
       weight[i] = Math.min(8, xs.length) * Math.min(1, Math.max(0.05, eLast) / 20);
@@ -255,11 +353,15 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
       rawD[i] = null;
       rawC[i] = ys[0];
       rawSe[i] = null;
+      rawSigma[i] = null;
+      rawRho[i] = null;
       weight[i] = 0.5 * Math.min(1, Math.max(0.05, eLast) / 20);
     } else {
       rawD[i] = null;
       rawC[i] = null;
       rawSe[i] = null;
+      rawSigma[i] = null;
+      rawRho[i] = null;
       weight[i] = 0;
     }
   }
@@ -286,6 +388,16 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
   }
   const globalMean = globalW > 0 ? globalSum / globalW : PRIOR_B_E;
 
+  // Fallback walk scale for trophies without their own increment history: the
+  // median per-trophy walk scale over the trophies that have one, else 0.15.
+  const rhoList: number[] = [];
+  for (let i = 0; i < c.trophies.length; i++) if (rawRho[i] !== null) rhoList.push(rawRho[i] as number);
+  const medianRhoE = rhoList.length > 0 ? median(rhoList) : 0.15;
+  /** The fallback walk scale with the rounding floor removed (see ROUNDING_LOG_SD). */
+  const medianRhoEAdj = Math.sqrt(
+    Math.max(0, medianRhoE * medianRhoE - ROUNDING_LOG_SD * ROUNDING_LOG_SD),
+  );
+
   const out: Array<{ id: number; q: number[] }> = [];
   for (let i = 0; i < c.trophies.length; i++) {
     const t = c.trophies[i];
@@ -304,19 +416,30 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
       d = Math.min(3, Math.max(-0.5, d));
       logEtarget = rawC[i] + d * xTarget;
       const se = rawSe[i] !== null && Number.isFinite(rawSe[i]) ? rawSe[i] as number : 0.2;
+      const sigmaE = rawSigma[i] !== null ? (rawSigma[i] as number) : 0;
+      const rhoERaw = rawRho[i] !== null ? (rawRho[i] as number) : medianRhoE;
+      // Rounding jitter is not refresh signal: remove its floor in quadrature.
+      const rhoE = Math.sqrt(Math.max(0, rhoERaw * rhoERaw - ROUNDING_LOG_SD * ROUNDING_LOG_SD));
+      // Slope uncertainty x distance, plus the fit's residual noise, plus the
+      // future-refresh walk (per-refresh scale x sqrt of refreshes to come),
+      // plus the per-tier base. The walk term is what v1 missed: without it a
+      // multi-refresh horizon is scored as if the next refreshes were noiseless.
       spreadE = Math.sqrt(
-        Math.pow(Math.max(0.08, se) * Math.max(0, xTarget - xLast), 2) + tierBaseSpread * tierBaseSpread,
+        Math.pow(Math.max(0.08, se) * Math.max(0, xTarget - xLast), 2) +
+          sigmaE * sigmaE +
+          Math.pow(rhoE * futureWalk, 2) +
+          tierBaseSpread * tierBaseSpread,
       );
     } else if (rawC[i] !== null) {
       // One observation: anchor on it (at its own time), grow at the tier slope.
       d = tierSlope;
       logEtarget = rawC[i] + d * (xTarget - rawXObs[i]);
-      spreadE = 0.15;
+      spreadE = Math.sqrt(0.15 * 0.15 + Math.pow(medianRhoEAdj * futureWalk, 2));
     } else {
       // Never observed: half an earner at the last state, growing at the tier slope.
       d = tierSlope;
       logEtarget = Math.log(0.5) + d * (xTarget - xLast);
-      spreadE = 0.3;
+      spreadE = Math.sqrt(0.3 * 0.3 + Math.pow(medianRhoEAdj * futureWalk, 2));
     }
 
     // A trophy every tracked player holds stays (nearly) universal: its earners
@@ -333,12 +456,25 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
     const median = clampPct((100 * eTarget) / pTarget);
 
     // Flat-history regime: the launch-refresh prior is the whole forecast, and the
-    // spread is the calibrated residual (2-decimal rounding + the small per-trophy
-    // variation around the uniform dilution the dev board shows: dilution models land
-    // within ~0.01-0.02 logit there, so 0.02 covers it with room).
+    // spread is the refresh risk the practice showed. v1's 0.02 came from the
+    // dev-board claim that dilution models land within ~0.01-0.02 logit; the dev
+    // grade proved it wrong (coverage 0.191). The recalibrated spread has three
+    // honest parts: one unseen refresh moves a trophy's logit rate by REFRESH_SD
+    // (0.22, from the practice aggregates), accumulating over the refreshes the
+    // horizon holds (at least one, one per REFRESH_LOG_SPAN of log-time); the
+    // launch-prior slope is uncertain by PRIOR_SLOPE_SD per unit of log-time, so
+    // its contribution grows with the extrapolation distance; and a 0.03 base for
+    // rounding and refresh timing. At the practice distance (d = 1.87) this lands
+    // at s = 0.25, the pinball-optimal spread the Monte Carlo found.
     let s: number;
     if (states.length === 1) {
-      s = 0.02;
+      const dFlat = Math.max(0, xTarget - xLast);
+      const nRef = Math.max(1, dFlat / REFRESH_LOG_SPAN);
+      s = Math.sqrt(
+        REFRESH_SD * REFRESH_SD * nRef +
+          PRIOR_SLOPE_SD * PRIOR_SLOPE_SD * dFlat * dFlat +
+          0.03 * 0.03,
+      );
     } else {
       // Model risk: log-time curves are an approximation, and the further past the
       // last state the target sits, the more the approximation can bend (saturation
